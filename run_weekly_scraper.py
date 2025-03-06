@@ -83,6 +83,9 @@ def check_most_recent_year():
         logging.error(f"Error in check_most_recent_year: {e}")
         return False
 
+
+
+
 def run_scraper_job():
     """Run the UN Resolution scraper as a scheduled job."""
     logging.info("Starting scheduled UN resolution scraper check")

@@ -23,7 +23,7 @@ from selenium.common.exceptions import (
 from bs4 import BeautifulSoup
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Configure logging for minimal output
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -35,11 +35,11 @@ BASE_SEARCH_URL = (
     "https://digitallibrary.un.org/search?cc=Voting%20Data&ln=en&p=&f=&rm=&sf=&so=d"
     "&rg=50&c=Voting%20Data&c=&of=hb&fti=1&fct__9=Vote&fti=1"
 )
-CSV_FILE = "data/UN_VOTING_DATA.csv"  # Single master CSV file
-MAX_PAGES_PER_YEAR = 50  # Adjust as needed
+CSV_FILE = "data/UN_VOTING_DATA.csv"  # Master CSV file
+MAX_PAGES_PER_YEAR = 50  # Maximum pages to paginate per year
 
 # Parallelism settings
-MAX_WORKERS = 2  # Number of parallel browser sessions (be careful not to use too many)
+MAX_WORKERS = 2
 
 # Fixed columns for CSV output
 FIXED_COLUMNS = [
@@ -47,11 +47,13 @@ FIXED_COLUMNS = [
     "ABSENT COUNT", "NO COUNT", "YES COUNT", "Link", "token", "Scrape_Year"
 ]
 
-# Anti-blocking measures - minimized but effective
+# Anti-blocking measures
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15"
 ]
+
+# ---------------------- Utility & Browser Functions ------------------------
 
 def prevent_sleep():
     """Prevent system sleep if running on Windows."""
@@ -65,71 +67,88 @@ def prevent_sleep():
             logging.warning(f"Error preventing sleep: {e}")
 
 def get_driver():
-    """Configure and return a Chrome webdriver instance with minimal anti-blocking."""
+    """Configure and return a Chrome webdriver instance."""
     options = Options()
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    
-    # Essential anti-blocking measures
     options.add_argument(f"user-agent={random.choice(USER_AGENTS)}")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    
-    # Performance optimizations
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--js-flags=--expose-gc")
     options.add_argument("--aggressive-cache-discard")
     options.add_argument("--disable-site-isolation-trials")
     
-    # Get driver path using webdriver_manager
     driver_path = ChromeDriverManager().install()
     try:
         os.chmod(driver_path, 0o755)
     except Exception as e:
-        logging.warning(f"Could not set executable permissions for {driver_path}: {e}")
+        logging.warning(f"Could not set permissions for {driver_path}: {e}")
         
     service = Service(executable_path=driver_path)
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(45)  # Slightly reduced timeout for faster failure detection
-    
-    # Basic stealth
+    driver.set_page_load_timeout(45)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
     return driver
 
 def check_for_next_button(driver):
-    """Return the next page button element if found, otherwise None."""
-    next_button = None
-    xpaths = [
-        "//a[.//img[@alt='next'] or .//img[@aria-label='Next page']]",
-        "//a[@class='img' and contains(@href, 'jrec=')]",
-        "//a[contains(text(), '›') or contains(text(), 'next') or contains(text(), 'Next')]"
-    ]
-    for xp in xpaths:
+    """Find the 'Next' page button."""
+    try:
+        next_button = driver.find_element(By.XPATH, "//a[img[@alt='next']]")
+        return next_button
+    except NoSuchElementException:
+        return None
+
+# ---------------------- CSV Links Handling (Regex-Based) ------------------------
+
+def normalize_link(href):
+    """
+    Normalize the URL by extracting the record ID if possible,
+    returning a standardized URL.
+    """
+    if not href:
+        return None
+    if '/record/' in href:
         try:
-            next_button = driver.find_element(By.XPATH, xp)
-            if next_button:
-                break
-        except NoSuchElementException:
-            continue
-    if not next_button:
-        pagination_links = driver.find_elements(By.XPATH, "//a[contains(@href, 'jrec=')]")
-        highest_jrec = 0
-        for link in pagination_links:
-            try:
-                href = link.get_attribute("href")
-                match = re.search(r'jrec=(\d+)', href)
-                if match:
-                    jrec = int(match.group(1))
-                    if jrec > highest_jrec:
-                        highest_jrec = jrec
-                        next_button = link
-            except Exception:
-                continue
-    return next_button
+            record_part = href.split('/record/')[1]
+            record_id = record_part.split('?')[0].split('/')[0].strip()
+            if record_id.isdigit():
+                return f"https://digitallibrary.un.org/record/{record_id}"
+        except (IndexError, ValueError):
+            pass
+    base_url = href.split('?')[0]
+    if '?' in href:
+        params = href.split('?')[1].split('&')
+        ln_param = [p for p in params if p.startswith('ln=')]
+        if ln_param:
+            base_url = f"{base_url}?{ln_param[0]}"
+    return base_url
+
+def get_links_from_csv_regex(csv_file):
+    """
+    Open the CSV file line by line and extract all UN digital library links
+    using a regex. Return a list of unique normalized links.
+    """
+    links = set()
+    # Regex pattern for a UN record URL: https://digitallibrary.un.org/record/<digits>
+    pattern = re.compile(r'https://digitallibrary\.un\.org/record/\d+')
+    try:
+        with open(csv_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                found = pattern.findall(line)
+                for link in found:
+                    norm = normalize_link(link)
+                    if norm:
+                        links.add(norm)
+        logging.info(f"Regex extracted {len(links)} unique links from CSV")
+    except Exception as e:
+        logging.error(f"Error reading CSV with regex: {e}")
+    return list(links)
+
+# ---------------------- Year-Based Scraping Functions ------------------------
 
 def get_available_years(driver):
     """Extract available years and their counts from the date facet."""
@@ -138,7 +157,6 @@ def get_available_years(driver):
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.XPATH, "//ul[contains(@class, 'option-fct')]"))
         )
-        
         date_headers = driver.find_elements(By.XPATH, "//h2[text()='Date']")
         for header in date_headers:
             try:
@@ -150,7 +168,6 @@ def get_available_years(driver):
                         time.sleep(0.5)
                     except (NoSuchElementException, ElementNotInteractableException):
                         pass
-                
                 year_inputs = facet_section.find_elements(By.XPATH, ".//input[@type='checkbox']")
                 for inp in year_inputs:
                     year_value = inp.get_attribute("value")
@@ -171,32 +188,24 @@ def get_available_years(driver):
             except Exception as e:
                 logging.error(f"Error processing date header: {e}")
                 continue
-        return sorted(date_facets, key=lambda x: x['year'], reverse=True)
+        return sorted(date_facets, key=lambda x: x['year'], reverse=False)
     except Exception as e:
         logging.error(f"Error getting available years: {e}")
         return []
 
-def select_year_facet(driver, year_data, max_retries=2):
-    """Select a specific year - optimized for speed."""
+def select_year_facet(driver, year_data, max_retries=10):
+    """Select a specific year by clicking its checkbox."""
     for retry in range(max_retries):
         try:
             logging.info(f"Selecting year: {year_data['year']} (Attempt {retry+1}/{max_retries})")
-            
-            # Find and select the checkbox
             checkbox = driver.find_element(By.ID, year_data['input_id'])
             driver.execute_script("arguments[0].scrollIntoView();", checkbox)
             time.sleep(0.2)
-            
-            # Click with JavaScript
             driver.execute_script("arguments[0].click();", checkbox)
-            time.sleep(1)  # Minimum wait
-            
-            # Wait for results to load
+            time.sleep(1)
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/record/')]"))
             )
-            
-            # Simple verification - just check if we have results
             records = driver.find_elements(By.XPATH, "//a[contains(@href, '/record/')]")
             if records and len(records) > 0:
                 logging.info(f"Selected year {year_data['year']} with {len(records)} visible records")
@@ -213,34 +222,29 @@ def select_year_facet(driver, year_data, max_retries=2):
             logging.error(f"Error selecting year {year_data['year']}: {e}")
             if retry < max_retries - 1:
                 clear_filters(driver)
-    
-    # Quick fallback approach
     try:
         logging.warning(f"Trying fallback for year {year_data['year']}...")
         driver.get(BASE_SEARCH_URL)
         time.sleep(1.5)
-        
-        # Try explicit wait for facets
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.XPATH, "//h2[text()='Date']"))
         )
-        
         checkbox = driver.find_element(By.ID, year_data['input_id'])
         driver.execute_script("arguments[0].click();", checkbox)
         time.sleep(1.5)
-        
         records = driver.find_elements(By.XPATH, "//a[contains(@href, '/record/')]")
         if records and len(records) > 0:
             logging.info(f"Fallback: Selected year {year_data['year']} with {len(records)} visible records")
             return True
     except Exception as e:
         logging.error(f"Fallback selection failed: {e}")
-    
     logging.error(f"Failed to select year {year_data['year']} after multiple attempts")
     return False
 
-def collect_links_for_year(driver, year):
-    """Collect links for the given year - optimized for speed."""
+def collect_links_for_year(driver, year, existing_links):
+    """
+    Collect links for the given year. Normalize each link and skip it if it's already in existing_links.
+    """
     all_links = set()
     page_count = 0
     consecutive_no_new = 0
@@ -250,7 +254,6 @@ def collect_links_for_year(driver, year):
         prevent_sleep()
         page_count += 1
         logging.info(f"[Year {year}] Processing page {page_count}...")
-        
         try:
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/record/')]"))
@@ -260,33 +263,25 @@ def collect_links_for_year(driver, year):
             break
 
         links_before = len(all_links)
-        
         try:
-            # More efficient link collection
-            links = set()
+            new_links = set()
             elements = driver.find_elements(By.XPATH, "//a[contains(@href, '/record/')]")
-            
             for elem in elements:
                 try:
                     href = elem.get_attribute("href")
-                    if href and '/record/' in href:
-                        base_url = href.split('?')[0]
-                        if '?' in href:
-                            params = href.split('?')[1].split('&')
-                            ln_param = [p for p in params if p.startswith('ln=')]
-                            if ln_param:
-                                base_url = f"{base_url}?{ln_param[0]}"
-                        links.add(base_url)
+                    norm_link = normalize_link(href)
+                    if norm_link:
+                        if norm_link in existing_links:
+                            continue  # Skip already scraped links
+                        new_links.add(norm_link)
                 except StaleElementReferenceException:
                     continue
-            
-            all_links.update(links)
+            all_links.update(new_links)
         except Exception as e:
             logging.error(f"[Year {year}] Error collecting links: {e}")
 
         new_count = len(all_links) - links_before
-        logging.info(f"[Year {year}] Found {new_count} new links on page {page_count} (Total: {len(all_links)})")
-        
+        logging.info(f"[Year {year}] Found {new_count} new links on page {page_count} (Total new: {len(all_links)})")
         if new_count == 0:
             consecutive_no_new += 1
             if consecutive_no_new >= max_no_new:
@@ -301,135 +296,23 @@ def collect_links_for_year(driver, year):
                 driver.execute_script("arguments[0].scrollIntoView();", next_button)
                 time.sleep(0.2)
                 driver.execute_script("arguments[0].click();", next_button)
-                time.sleep(1)  # Minimum wait after clicking next
+                time.sleep(1)
             except Exception as e:
                 logging.error(f"[Year {year}] Error clicking next button: {e}")
                 break
         else:
             logging.info(f"[Year {year}] No next button found; reached last page.")
             break
-    
+
+    # Update the in-memory set with links from this year
+    existing_links.update(all_links)
+    logging.info(f"[Year {year}] Collected {len(all_links)} unique new links")
     return list(all_links)
 
-def process_resolution(link, driver, year):
-    """Process a single resolution and return row data."""
-    try:
-        # Extract record ID from the link
-        record_id = link.split('/record/')[1].split('?')[0] if '/record/' in link else link.split('/')[-1]
-        short_link = f".../record/{record_id}"
-        
-        # Log with shorter link for readability
-        logging.info(f"Loading: {short_link}")
-        
-        # Load the page
-        driver.get(link)
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'metadata-row')]"))
-        )
-        
-        # Create base row data
-        row_data = {
-            "Link": link,
-            "token": record_id,
-            "Scrape_Year": year
-        }
-        
-        # Process HTML content
-        html_content = driver.page_source
-        extracted = extract_vote_data_from_html(html_content)
-        
-        if extracted:
-            if extracted.get('Title'):
-                row_data['Title'] = extracted['Title']
-                row_data['Council'] = determine_council(extracted['Title'])
-            if extracted.get('Resolution'):
-                row_data['Resolution'] = extracted['Resolution']
-            if extracted.get('Vote date'):
-                row_data['Date'] = extracted['Vote date']
-            if extracted.get('Vote summary'):
-                summary = extracted['Vote summary']
-                if m := re.search(r'Yes:\s*(\d+)', summary):
-                    row_data['YES COUNT'] = m.group(1)
-                if m := re.search(r'No:\s*(\d+)', summary):
-                    row_data['NO COUNT'] = m.group(1)
-                if m := re.search(r'Abstentions:\s*(\d+)', summary):
-                    row_data['ABSENT COUNT'] = m.group(1)
-                if m := re.search(r'Non-Voting:\s*(\d+)', summary):
-                    row_data['NO-VOTE COUNT'] = m.group(1)
-                if m := re.search(r'Total voting membership:\s*(\d+)', summary):
-                    row_data['TOTAL VOTES'] = m.group(1)
-            if 'Vote Data' in extracted:
-                for country, vote in extracted['Vote Data'].items():
-                    if vote == 'Y':
-                        row_data[country] = 'YES'
-                    elif vote == 'N':
-                        row_data[country] = 'NO'
-                    elif vote == 'A':
-                        row_data[country] = 'ABSTAIN'
-        
-        # Return data if we have meaningful fields
-        if row_data.get('Title') or row_data.get('Resolution'):
-            return row_data
-        return None
-    except Exception as e:
-        logging.error(f"Error processing link {link}: {e}")
-        return None
-
-def batch_scrape_resolutions(links, driver, year, batch_size=15):
-    """Scrape resolutions in batches and return rows ready for CSV."""
-    batch_rows = []
-    total_links = len(links)
-    
-    for i in range(0, total_links, batch_size):
-        batch = links[i:i+batch_size]
-        logging.info(f"Processing batch {i//batch_size + 1}/{(total_links + batch_size - 1)//batch_size} ({len(batch)} links)")
-        
-        for link in batch:
-            row_data = process_resolution(link, driver, year)
-            if row_data:
-                batch_rows.append(row_data)
-            time.sleep(0.2)  # Minimal delay between links
-        
-        # Very small delay between batches
-        time.sleep(0.5)
-    
-    return batch_rows
-
-def parallel_scrape_resolutions(links, year, num_workers=2, batch_size=15):
-    """Process resolutions in parallel using multiple browser instances."""
-    if not links:
-        return []
-    
-    all_rows = []
-    
-    # Split links into chunks for each worker
-    chunks = [links[i::num_workers] for i in range(num_workers)]
-    
-    def worker_task(worker_id, worker_links):
-        worker_rows = []
-        worker_driver = get_driver()
-        
-        try:
-            worker_rows = batch_scrape_resolutions(worker_links, worker_driver, year, batch_size)
-            logging.info(f"Worker {worker_id} completed processing {len(worker_links)} links, found {len(worker_rows)} records")
-        except Exception as e:
-            logging.error(f"Worker {worker_id} error: {e}")
-        finally:
-            worker_driver.quit()
-        
-        return worker_rows
-    
-    # Process in parallel
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(worker_task, i, chunk) for i, chunk in enumerate(chunks)]
-        for future in futures:
-            worker_results = future.result()
-            all_rows.extend(worker_results)
-    
-    return all_rows
+# ---------------------- Resolution Processing Functions ------------------------
 
 def extract_vote_data_from_html(html_content):
-    """Extract vote data from HTML using JSON-LD or scraping metadata rows."""
+    """Extract vote data from HTML using JSON-LD or by scraping metadata rows."""
     soup = BeautifulSoup(html_content, "html.parser")
     data = {}
     try:
@@ -440,7 +323,6 @@ def extract_vote_data_from_html(html_content):
             data['Date'] = json_data.get('datePublished', '')
     except Exception:
         pass
-        
     for row in soup.find_all('div', class_='metadata-row'):
         try:
             title_elem = row.find('span', class_='title')
@@ -474,78 +356,207 @@ def determine_council(title):
         return "General Assembly"
     return "Unknown"
 
+def process_resolution(link, driver, year):
+    """Process a single resolution page and return row data."""
+    try:
+        record_id = link.split('/record/')[1].split('?')[0] if '/record/' in link else link.split('/')[-1]
+        short_link = f".../record/{record_id}"
+        logging.info(f"Loading: {short_link}")
+        driver.get(link)
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'metadata-row')]"))
+        )
+        row_data = {
+            "Link": link,
+            "token": record_id,
+            "Scrape_Year": year
+        }
+        html_content = driver.page_source
+        extracted = extract_vote_data_from_html(html_content)
+        if extracted:
+            if extracted.get('Title'):
+                row_data['Title'] = extracted['Title']
+                row_data['Council'] = determine_council(extracted['Title'])
+            if extracted.get('Resolution'):
+                row_data['Resolution'] = extracted['Resolution']
+            if extracted.get('Vote date'):
+                row_data['Date'] = extracted['Vote date']
+            if extracted.get('Vote summary'):
+                summary = extracted['Vote summary']
+                if m := re.search(r'Yes:\s*(\d+)', summary):
+                    row_data['YES COUNT'] = m.group(1)
+                if m := re.search(r'No:\s*(\d+)', summary):
+                    row_data['NO COUNT'] = m.group(1)
+                if m := re.search(r'Abstentions:\s*(\d+)', summary):
+                    row_data['ABSENT COUNT'] = m.group(1)
+                if m := re.search(r'Non-Voting:\s*(\d+)', summary):
+                    row_data['NO-VOTE COUNT'] = m.group(1)
+                if m := re.search(r'Total voting membership:\s*(\d+)', summary):
+                    row_data['TOTAL VOTES'] = m.group(1)
+            if 'Vote Data' in extracted:
+                for country, vote in extracted['Vote Data'].items():
+                    if vote == 'Y':
+                        row_data[country] = 'YES'
+                    elif vote == 'N':
+                        row_data[country] = 'NO'
+                    elif vote == 'A':
+                        row_data[country] = 'ABSTAIN'
+        if row_data.get('Title') or row_data.get('Resolution'):
+            return row_data
+        return None
+    except Exception as e:
+        logging.error(f"Error processing link {link}: {e}")
+        return None
+
+def batch_scrape_resolutions(links, driver, year, batch_size=15):
+    """Scrape resolution pages in batches and return rows ready for CSV."""
+    batch_rows = []
+    total_links = len(links)
+    for i in range(0, total_links, batch_size):
+        batch = links[i:i+batch_size]
+        logging.info(f"Processing batch {i//batch_size + 1}/{(total_links + batch_size - 1)//batch_size} ({len(batch)} links)")
+        for link in batch:
+            row_data = process_resolution(link, driver, year)
+            if row_data:
+                batch_rows.append(row_data)
+            time.sleep(0.2)
+        time.sleep(0.5)
+    return batch_rows
+
+def parallel_scrape_resolutions(links, year, num_workers=2, batch_size=15):
+    """Process resolution pages in parallel using multiple browser instances."""
+    if not links:
+        return []
+    all_rows = []
+    chunks = [links[i::num_workers] for i in range(num_workers)]
+    def worker_task(worker_id, worker_links):
+        worker_rows = []
+        worker_driver = get_driver()
+        try:
+            worker_rows = batch_scrape_resolutions(worker_links, worker_driver, year, batch_size)
+            logging.info(f"Worker {worker_id} processed {len(worker_links)} links, found {len(worker_rows)} records")
+        except Exception as e:
+            logging.error(f"Worker {worker_id} error: {e}")
+        finally:
+            worker_driver.quit()
+        return worker_rows
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(worker_task, i, chunk) for i, chunk in enumerate(chunks)]
+        for future in futures:
+            worker_results = future.result()
+            all_rows.extend(worker_results)
+    return all_rows
+
+def get_all_columns_from_csv(filepath):
+    """Extract extra columns from the CSV to maintain consistency."""
+    if not os.path.exists(filepath):
+        return []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            extra_columns = [col for col in header if col not in FIXED_COLUMNS]
+            return extra_columns
+    except Exception as e:
+        logging.error(f"Error reading CSV headers: {e}")
+        return []
+
 def save_to_csv(rows, append=False):
-    """Save collected data rows to single master CSV with deduplication."""
+    """Save collected resolution data to the master CSV file with deduplication."""
     if not rows:
         logging.info("No data to save.")
         return False
-    
     try:
         output_file = CSV_FILE
-        
-        # Fast deduplication using dictionaries
         existing_records = {}
+        existing_tokens = set()
+        existing_links = set()
         if append and os.path.exists(output_file):
             try:
-                # Use pandas for efficient CSV loading
-                df = pd.read_csv(output_file)
+                df = pd.read_csv(output_file, encoding='utf-8', dtype=str, on_bad_lines='skip')
                 if 'token' in df.columns and 'Link' in df.columns:
-                    # Create a composite key for each record
                     for _, row in df.iterrows():
-                        key = f"{row['token']}_{row['Link']}"
-                        existing_records[key] = True
+                        token = row.get('token', '').strip()
+                        link = row.get('Link', '').strip()
+                        if token and link:
+                            key = f"{token}_{link}"
+                            existing_records[key] = True
+                        if token:
+                            existing_tokens.add(token)
+                        if link:
+                            existing_links.add(link)
                 elif 'Link' in df.columns:
                     for _, row in df.iterrows():
-                        existing_records[row['Link']] = True
+                        link = row.get('Link', '').strip()
+                        if link:
+                            existing_records[link] = True
+                            existing_links.add(link)
+                logging.info(f"Loaded {len(existing_records)} existing records for deduplication")
             except Exception as e:
                 logging.warning(f"Error reading existing CSV: {e}")
-        
-        # Filter out duplicates efficiently
+                try:
+                    with open(output_file, 'r', encoding='utf-8') as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            token = row.get('token', '').strip()
+                            link = row.get('Link', '').strip()
+                            if token and link:
+                                key = f"{token}_{link}"
+                                existing_records[key] = True
+                            if token:
+                                existing_tokens.add(token)
+                            if link:
+                                existing_links.add(link)
+                    logging.info(f"Fallback: Loaded {len(existing_records)} existing records")
+                except Exception as fallback_error:
+                    logging.error(f"Fallback CSV reading failed: {fallback_error}")
         unique_rows = []
         duplicates = 0
-        
         for row in rows:
-            # Create a unique key
-            key = f"{row.get('token')}_{row.get('Link')}" if row.get('token') else row.get('Link')
-            
-            if key not in existing_records:
-                unique_rows.append(row)
-                existing_records[key] = True
-            else:
+            token = row.get('token', '').strip()
+            link = row.get('Link', '').strip()
+            primary_key = f"{token}_{link}" if token and link else None
+            if (primary_key and primary_key in existing_records) or (token and token in existing_tokens) or (link and link in existing_links):
                 duplicates += 1
-        
+                continue
+            unique_rows.append(row)
+            if primary_key:
+                existing_records[primary_key] = True
+            if token:
+                existing_tokens.add(token)
+            if link:
+                existing_links.add(link)
         if duplicates > 0:
             logging.info(f"Filtered out {duplicates} duplicate records")
-        
         if not unique_rows:
             logging.info("No unique records to save")
             return True
-        
-        # Prepare column list
         all_cols = set(FIXED_COLUMNS)
+        if append and os.path.exists(output_file):
+            existing_country_columns = get_all_columns_from_csv(output_file)
+            all_cols.update(existing_country_columns)
         for row in unique_rows:
             all_cols.update(row.keys())
-        extra_cols = sorted(list(all_cols - set(FIXED_COLUMNS)))
-        column_order = FIXED_COLUMNS + extra_cols
-        
-        # Efficient CSV writing
+        country_cols = sorted(list(all_cols - set(FIXED_COLUMNS)))
+        column_order = FIXED_COLUMNS + country_cols
+        for row in unique_rows:
+            for col in column_order:
+                if col not in row:
+                    row[col] = ""
         mode = "a" if append and os.path.exists(output_file) else "w"
+        write_header = not (append and os.path.exists(output_file))
         with open(output_file, mode, newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=column_order)
-            if mode == "w":  # Only write header for new files
+            if write_header:
                 writer.writeheader()
             writer.writerows(unique_rows)
-        
-        # Print progress update
         if os.path.exists(output_file):
             try:
-                # Use faster method to count lines
                 with open(output_file, 'r', encoding='utf-8') as f:
-                    total_rows = sum(1 for _ in f) - 1  # Subtract header row
+                    total_rows = sum(1 for _ in f) - 1
                 logging.info(f"Saved {len(unique_rows)} new records. Total in {output_file}: {total_rows}")
             except:
                 logging.info(f"Saved {len(unique_rows)} new records")
-            
         return True
     except Exception as e:
         logging.error(f"Error saving CSV: {e}")
@@ -554,11 +565,9 @@ def save_to_csv(rows, append=False):
 def clear_filters(driver):
     """Clear all filters to reset the search."""
     try:
-        # Try to find a clear button first
         clear_buttons = driver.find_elements(
             By.XPATH, "//a[contains(text(), 'Clear') or contains(@class, 'clear') or contains(@onclick, 'clear')]"
         )
-        
         if clear_buttons:
             for button in clear_buttons:
                 try:
@@ -567,48 +576,34 @@ def clear_filters(driver):
                     return True
                 except Exception:
                     continue
-        
-        # If no clear button worked, reload the base page
         driver.get(BASE_SEARCH_URL)
         time.sleep(1)
-        
-        # Wait for the page to load with standard results
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/record/')]"))
         )
-        
         return True
     except Exception as e:
         logging.error(f"Error clearing filters: {e}")
-        
-        # Try one more time with a direct page load
         try:
             driver.get(BASE_SEARCH_URL)
             time.sleep(1)
             return True
         except:
             pass
-            
         return False
 
 def refresh_browser_session(driver):
-    """Refresh the browser session - optimized for speed."""
+    """Refresh the browser session."""
     try:
         logging.info("Refreshing browser session...")
         driver.quit()
-        time.sleep(1)  # Shorter cooldown
-        
-        # Create a new driver
+        time.sleep(1)
         new_driver = get_driver()
-        
-        # Load the base page
         new_driver.get(BASE_SEARCH_URL)
         time.sleep(1)
-        
         WebDriverWait(new_driver, 15).until(
             EC.presence_of_element_located((By.XPATH, "//ul[contains(@class, 'option-fct')]"))
         )
-        
         logging.info("Browser session refreshed")
         return new_driver
     except Exception as e:
@@ -618,21 +613,72 @@ def refresh_browser_session(driver):
         except:
             raise
 
+def clean_existing_csv():
+    """
+    Clean the existing CSV file by removing duplicate entries.
+    Create a backup before writing the cleaned file.
+    """
+    if not os.path.exists(CSV_FILE):
+        logging.info(f"No CSV file {CSV_FILE} exists yet. Nothing to clean.")
+        return False
+    try:
+        logging.info(f"Cleaning CSV file {CSV_FILE} to remove duplicates...")
+        df = pd.read_csv(CSV_FILE, encoding='utf-8', dtype=str, on_bad_lines='skip')
+        initial_rows = len(df)
+        if initial_rows == 0:
+            logging.info("CSV file is empty. Nothing to clean.")
+            return False
+        logging.info(f"CSV loaded with {initial_rows} rows")
+        if 'token' in df.columns and 'Link' in df.columns:
+            df['dedup_key'] = df.apply(lambda row: f"{row.get('token', '').strip()}_{row.get('Link', '').strip()}", axis=1)
+            df = df.drop_duplicates(subset=['dedup_key'], keep='first')
+            df = df.drop(columns=['dedup_key'])
+        elif 'token' in df.columns:
+            df = df.drop_duplicates(subset=['token'], keep='first')
+        elif 'Link' in df.columns:
+            df = df.drop_duplicates(subset=['Link'], keep='first')
+        final_rows = len(df)
+        duplicates_removed = initial_rows - final_rows
+        if duplicates_removed > 0:
+            backup_file = f"{CSV_FILE}.backup"
+            os.rename(CSV_FILE, backup_file)
+            df.to_csv(CSV_FILE, index=False)
+            logging.info(f"Cleaned CSV file: Removed {duplicates_removed} duplicates. Original backed up to {backup_file}")
+            return True
+        else:
+            logging.info("No duplicates found in CSV file.")
+            return False
+    except Exception as e:
+        logging.error(f"Error cleaning CSV: {e}")
+        return False
+
+# ---------------------- Main Function ------------------------
+
 def main():
-    """Main function with parallel processing for maximum speed."""
+    """Main function with improved deduplication and link comparison."""
+    os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
+    
     logging.info(f"Starting UN Resolution Vote Scraper - writing all data to {CSV_FILE}")
+    
+    if os.path.exists(CSV_FILE):
+        clean_existing_csv()
+    else:
+        save_to_csv([], append=False)
+        logging.info(f"Created new master CSV file: {CSV_FILE}")
+    
+    # Load all links from CSV using regex into an in-memory set (no file writing)
+    csv_links = set(get_links_from_csv_regex(CSV_FILE))
+    logging.info(f"Loaded {len(csv_links)} unique links from CSV for deduplication")
+    
     driver = get_driver()
-    
-    # Session management
     session_request_count = 0
-    SESSION_RESET_THRESHOLD = 150  # Increased for fewer resets
-    
+    SESSION_RESET_THRESHOLD = 150
+
     try:
         prevent_sleep()
-        logging.info(f"Loading base search page...")
+        logging.info("Loading base search page...")
         driver.get(BASE_SEARCH_URL)
         time.sleep(1)
-        
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.XPATH, "//ul[contains(@class, 'option-fct')]"))
         )
@@ -643,120 +689,65 @@ def main():
             return
         
         logging.info(f"Found {len(years_data)} years to process")
-
-        processed_years_file = "processed_years.txt"
-        processed_years = set()
         
-        if os.path.exists(processed_years_file):
-            with open(processed_years_file, "r") as f:
-                processed_years = set(line.strip() for line in f)
-            logging.info(f"Previously processed years: {', '.join(processed_years)}")
-        
-        # Create a fresh CSV file if none exists yet
-        if not os.path.exists(CSV_FILE) and not processed_years:
-            # Initialize an empty file with just headers
-            empty_rows = []
-            save_to_csv(empty_rows, append=False)
-            logging.info(f"Created new master CSV file: {CSV_FILE}")
-        
-        # Process each year independently
         for year_data in years_data:
             year = year_data['year']
-            if year in processed_years:
-                logging.info(f"Skipping already processed year: {year}")
-                continue
-                
             logging.info(f"\n{'='*60}\nProcessing year {year} ({year_data['count']} records)\n{'='*60}")
             
-            # Reset browser session between years (but not too often)
             if session_request_count > SESSION_RESET_THRESHOLD:
                 driver = refresh_browser_session(driver)
                 session_request_count = 0
             
-            # Select the year facet
-            if not select_year_facet(driver, year_data, max_retries=2):
+            if not select_year_facet(driver, year_data, max_retries=10):
                 logging.error(f"Failed to select facet for {year}; skipping to next year.")
                 continue
             
-            # Collect links for this year
             session_request_count += 1
-            year_links = collect_links_for_year(driver, year)
             
+            # Collect links for the year; check against the in-memory csv_links set
+            year_links = collect_links_for_year(driver, year, csv_links)
             if not year_links:
-                logging.warning(f"No links found for year {year}.")
+                logging.warning(f"No new links found for year {year}.")
                 continue
-                
-            logging.info(f"Collected {len(year_links)} links for year {year}")
             
-            # Process resolutions in batches with parallel processing
-            BATCH_SIZE = 40  # Increased batch size for very fast processing
+            logging.info(f"Collected {len(year_links)} new links for year {year}")
             
+            BATCH_SIZE = 40
             if len(year_links) > 50 and MAX_WORKERS > 1:
-                # For large link sets, use parallel processing
                 logging.info(f"Using parallel processing with {MAX_WORKERS} workers")
                 batch_rows = parallel_scrape_resolutions(year_links, year, num_workers=MAX_WORKERS, batch_size=BATCH_SIZE)
-                
-                # Save all rows from parallel processing
                 if batch_rows:
                     save_to_csv(batch_rows, append=True)
             else:
-                # For smaller link sets, process in the main thread in batches
                 for i in range(0, len(year_links), BATCH_SIZE):
                     prevent_sleep()
                     session_request_count += 1
-                    
                     batch_links = year_links[i:i+BATCH_SIZE]
                     logging.info(f"Processing batch {i//BATCH_SIZE + 1}/{(len(year_links) + BATCH_SIZE - 1)//BATCH_SIZE} ({len(batch_links)} links)")
-                    
-                    # Check if we need to reset the session
                     if session_request_count >= SESSION_RESET_THRESHOLD:
                         logging.info(f"Session reset threshold reached ({SESSION_RESET_THRESHOLD} requests)")
                         driver = refresh_browser_session(driver)
                         session_request_count = 0
-                    
-                    # Process this batch and get rows directly
                     batch_rows = batch_scrape_resolutions(batch_links, driver, year, batch_size=15)
-                    
-                    # Save directly to the master CSV
                     if batch_rows:
                         save_to_csv(batch_rows, append=True)
             
-            # Mark year as processed
-            with open(processed_years_file, "a") as f:
-                f.write(f"{year}\n")
-            processed_years.add(year)
-            
-            # Small break between years
+            csv_links.update(year_links)
             time.sleep(1)
             
         logging.info("Data collection complete!")
         
-        # Print final statistics
         if os.path.exists(CSV_FILE):
-            try:
-                df = pd.read_csv(CSV_FILE)
-                total_records = len(df)
-                year_counts = df['Scrape_Year'].value_counts().to_dict()
-                
-                logging.info(f"Final statistics:")
-                logging.info(f"Total records collected: {total_records}")
-                logging.info(f"Records by year: {year_counts}")
-                
-                # Count distinct councils
-                if 'Council' in df.columns:
-                    council_counts = df['Council'].value_counts().to_dict()
-                    logging.info(f"Records by council: {council_counts}")
-            except Exception as e:
-                logging.error(f"Error generating statistics: {e}")
-                
+            clean_existing_csv()
+            
     except Exception as e:
         logging.error(f"Unexpected error: {e}", exc_info=True)
     finally:
         try:
             driver.quit()
-        except:
+        except Exception:
             pass
         logging.info("Scraper finished.")
 
-if __name__ == "+_main__":
-    main()
+if __name__ == "__main__":
+    main()
