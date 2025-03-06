@@ -188,7 +188,7 @@ def get_available_years(driver):
             except Exception as e:
                 logging.error(f"Error processing date header: {e}")
                 continue
-        return sorted(date_facets, key=lambda x: x['year'], reverse=False)
+        return sorted(date_facets, key=lambda x: x['year'], reverse=True)
     except Exception as e:
         logging.error(f"Error getting available years: {e}")
         return []
