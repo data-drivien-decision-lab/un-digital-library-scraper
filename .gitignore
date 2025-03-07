@@ -1,0 +1,9 @@
+#hides openai api key
+.env
+
+#hide pycache
+__pycache__/
+
+#hide testing file
+test.py
+

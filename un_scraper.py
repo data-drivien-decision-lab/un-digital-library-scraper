@@ -35,7 +35,7 @@ BASE_SEARCH_URL = (
     "https://digitallibrary.un.org/search?cc=Voting%20Data&ln=en&p=&f=&rm=&sf=&so=d"
     "&rg=50&c=Voting%20Data&c=&of=hb&fti=1&fct__9=Vote&fti=1"
 )
-CSV_FILE = "data/UN_VOTING_DATA_TEST.csv"  # Master CSV file
+CSV_FILE = "data\UN_VOTING_DATA_RAW.csv"  # Master CSV file
 MAX_PAGES_PER_YEAR = 50  # Maximum pages to paginate per year
 
 # Parallelism settings
@@ -48,10 +48,20 @@ FIXED_COLUMNS = [
 ]
 
 # Anti-blocking measures
+# User agents list
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.5481.100 Safari/537.36"
 ]
+
+# Global counter to rotate user agents
+user_agent_index = 0
+
+def reset_user_agent_rotation():
+    """Reset user agent rotation to start from the first user agent."""
+    global user_agent_index
+    user_agent_index = 0
 
 # ---------------------- Utility & Browser Functions ------------------------
 
@@ -67,13 +77,21 @@ def prevent_sleep():
             logging.warning(f"Error preventing sleep: {e}")
 
 def get_driver():
-    """Configure and return a Chrome webdriver instance."""
+    """Configure and return a Chrome webdriver instance with alternating user agent."""
+    global user_agent_index
+
     options = Options()
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument(f"user-agent={random.choice(USER_AGENTS)}")
+
+    # Rotate user agent each time a new driver is created
+    user_agent = USER_AGENTS[user_agent_index]
+    user_agent_index = (user_agent_index + 1) % len(USER_AGENTS)  # Rotate to next
+
+    options.add_argument(f"user-agent={user_agent}")
+
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument("--disable-extensions")
@@ -81,18 +99,24 @@ def get_driver():
     options.add_argument("--js-flags=--expose-gc")
     options.add_argument("--aggressive-cache-discard")
     options.add_argument("--disable-site-isolation-trials")
-    
+
     driver_path = ChromeDriverManager().install()
+
     try:
         os.chmod(driver_path, 0o755)
     except Exception as e:
         logging.warning(f"Could not set permissions for {driver_path}: {e}")
-        
+
     service = Service(executable_path=driver_path)
     driver = webdriver.Chrome(service=service, options=options)
     driver.set_page_load_timeout(45)
+
+    # Hide automation flags
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    logging.info(f"Initialized browser with user-agent: {user_agent}")
     return driver
+
 
 def check_for_next_button(driver):
     """Find the 'Next' page button."""
@@ -192,6 +216,32 @@ def get_available_years(driver):
     except Exception as e:
         logging.error(f"Error getting available years: {e}")
         return []
+
+def retry_failed_links(failed_links, year):
+    """Retry processing failed links with a fresh browser session."""
+    if not failed_links:
+        return []
+
+    logging.info(f"Retrying {len(failed_links)} failed links for year {year}...")
+
+    retry_driver = get_driver()  # New session with rotated user-agent
+    retried_rows = []
+
+    try:
+        for link in failed_links:
+            try:
+                row_data = process_resolution(link, retry_driver, year)
+                if row_data:
+                    retried_rows.append(row_data)
+                time.sleep(0.2)
+            except Exception as e:
+                logging.error(f"Retry failed for link {link}: {e}")
+    finally:
+        retry_driver.quit()
+
+    logging.info(f"Retried {len(failed_links)} links, successfully recovered {len(retried_rows)} records.")
+    return retried_rows
+
 
 def select_year_facet(driver, year_data, max_retries=10):
     """Select a specific year by clicking its checkbox."""
@@ -409,43 +459,72 @@ def process_resolution(link, driver, year):
         return None
 
 def batch_scrape_resolutions(links, driver, year, batch_size=15):
-    """Scrape resolution pages in batches and return rows ready for CSV."""
+    """Scrape resolution pages in batches and return rows ready for CSV, tracking failures."""
     batch_rows = []
+    failed_links = []  # Collect failed links here
+
     total_links = len(links)
     for i in range(0, total_links, batch_size):
         batch = links[i:i+batch_size]
         logging.info(f"Processing batch {i//batch_size + 1}/{(total_links + batch_size - 1)//batch_size} ({len(batch)} links)")
+
         for link in batch:
-            row_data = process_resolution(link, driver, year)
-            if row_data:
-                batch_rows.append(row_data)
-            time.sleep(0.2)
+            try:
+                row_data = process_resolution(link, driver, year)
+                if row_data:
+                    batch_rows.append(row_data)
+                else:
+                    # If no data was returned but no exception was thrown, still count as a failure
+                    logging.warning(f"No data returned for link, added to failed links for retry: {link}")
+                    failed_links.append(link)
+                time.sleep(0.2)
+            except Exception as e:
+                logging.error(f"Error processing link {link}: {e}", exc_info=False)
+                failed_links.append(link)  # Capture failed link
+                logging.info(f"Added to failed links: {link}")
+
         time.sleep(0.5)
-    return batch_rows
+    
+    logging.info(f"Batch scraping completed: {len(batch_rows)} successful, {len(failed_links)} failed")
+    return batch_rows, failed_links
+
 
 def parallel_scrape_resolutions(links, year, num_workers=2, batch_size=15):
     """Process resolution pages in parallel using multiple browser instances."""
     if not links:
-        return []
+        return [], []  # Return empty lists for both rows and failed links
+    
     all_rows = []
+    all_failed_links = []  # Add collection for failed links
+    
     chunks = [links[i::num_workers] for i in range(num_workers)]
+    
     def worker_task(worker_id, worker_links):
-        worker_rows = []
         worker_driver = get_driver()
         try:
-            worker_rows = batch_scrape_resolutions(worker_links, worker_driver, year, batch_size)
-            logging.info(f"Worker {worker_id} processed {len(worker_links)} links, found {len(worker_rows)} records")
+            # Properly unpack both return values from batch_scrape_resolutions
+            worker_rows, worker_failed_links = batch_scrape_resolutions(worker_links, worker_driver, year, batch_size)
+            logging.info(f"Worker {worker_id} processed {len(worker_links)} links, found {len(worker_rows)} records, failed: {len(worker_failed_links)}")
+            return worker_rows, worker_failed_links  # Return both as a tuple
         except Exception as e:
             logging.error(f"Worker {worker_id} error: {e}")
+            # If an exception occurs, consider all links as failed
+            return [], worker_links
         finally:
             worker_driver.quit()
-        return worker_rows
+    
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(worker_task, i, chunk) for i, chunk in enumerate(chunks)]
         for future in futures:
-            worker_results = future.result()
-            all_rows.extend(worker_results)
-    return all_rows
+            # Unpack both values from the worker's result
+            worker_rows, worker_failed_links = future.result()
+            all_rows.extend(worker_rows)
+            all_failed_links.extend(worker_failed_links)
+    
+    logging.info(f"Parallel processing complete: {len(all_rows)} records found, {len(all_failed_links)} links failed")
+    
+    # Return both collections as a tuple
+    return all_rows, all_failed_links
 
 def get_all_columns_from_csv(filepath):
     """
@@ -673,6 +752,8 @@ def clean_existing_csv():
 def main():
     """Main function with improved deduplication and link comparison."""
     os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
+
+    reset_user_agent_rotation()
     
     logging.info(f"Starting UN Resolution Vote Scraper - writing all data to {CSV_FILE}")
     
@@ -731,9 +812,17 @@ def main():
             BATCH_SIZE = 40
             if len(year_links) > 50 and MAX_WORKERS > 1:
                 logging.info(f"Using parallel processing with {MAX_WORKERS} workers")
-                batch_rows = parallel_scrape_resolutions(year_links, year, num_workers=MAX_WORKERS, batch_size=BATCH_SIZE)
+                # Fix: Use year_links instead of undefined batch_links
+                batch_rows, failed_links = parallel_scrape_resolutions(year_links, year, MAX_WORKERS)
+
                 if batch_rows:
                     save_to_csv(batch_rows, append=True)
+                
+                # Check for failed_links here and retry if needed
+                if failed_links:
+                    retry_rows = retry_failed_links(failed_links, year)
+                    if retry_rows:
+                        save_to_csv(retry_rows, append=True)
             else:
                 for i in range(0, len(year_links), BATCH_SIZE):
                     prevent_sleep()
@@ -744,9 +833,17 @@ def main():
                         logging.info(f"Session reset threshold reached ({SESSION_RESET_THRESHOLD} requests)")
                         driver = refresh_browser_session(driver)
                         session_request_count = 0
-                    batch_rows = batch_scrape_resolutions(batch_links, driver, year, batch_size=15)
+                    
+                    # Fix: Correctly capture both return values from batch_scrape_resolutions
+                    batch_rows, failed_links = batch_scrape_resolutions(batch_links, driver, year, batch_size=15)
+                    
                     if batch_rows:
                         save_to_csv(batch_rows, append=True)
+
+                    if failed_links:
+                        retry_rows = retry_failed_links(failed_links, year)
+                        if retry_rows:
+                            save_to_csv(retry_rows, append=True)
             
             csv_links.update(year_links)
             time.sleep(1)
@@ -765,5 +862,6 @@ def main():
             pass
         logging.info("Scraper finished.")
 
-if __name__ == "__main__":
+
+if __name__ =="__main__":
     main()
