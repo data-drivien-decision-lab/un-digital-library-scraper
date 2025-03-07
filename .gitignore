@@ -7,3 +7,5 @@ __pycache__/
 #hide testing file
 test.py
 
+#hide venv
+venv/
