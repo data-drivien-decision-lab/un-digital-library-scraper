@@ -35,7 +35,7 @@ BASE_SEARCH_URL = (
     "https://digitallibrary.un.org/search?cc=Voting%20Data&ln=en&p=&f=&rm=&sf=&so=d"
     "&rg=50&c=Voting%20Data&c=&of=hb&fti=1&fct__9=Vote&fti=1"
 )
-CSV_FILE = "data/UN_VOTING_DATA.csv"  # Master CSV file
+CSV_FILE = "data/UN_VOTING_DATA_TEST.csv"  # Master CSV file
 MAX_PAGES_PER_YEAR = 50  # Maximum pages to paginate per year
 
 # Parallelism settings
@@ -188,7 +188,7 @@ def get_available_years(driver):
             except Exception as e:
                 logging.error(f"Error processing date header: {e}")
                 continue
-        return sorted(date_facets, key=lambda x: x['year'], reverse=False)
+        return sorted(date_facets, key=lambda x: x['year'], reverse=True)
     except Exception as e:
         logging.error(f"Error getting available years: {e}")
         return []
@@ -448,9 +448,13 @@ def parallel_scrape_resolutions(links, year, num_workers=2, batch_size=15):
     return all_rows
 
 def get_all_columns_from_csv(filepath):
-    """Extract extra columns from the CSV to maintain consistency."""
+    """
+    Extract all columns from an existing CSV, ensuring all are preserved.
+    This is used to preserve any historical country columns already in the file.
+    """
     if not os.path.exists(filepath):
         return []
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
@@ -460,17 +464,28 @@ def get_all_columns_from_csv(filepath):
     except Exception as e:
         logging.error(f"Error reading CSV headers: {e}")
         return []
+        
+
 
 def save_to_csv(rows, append=False):
-    """Save collected resolution data to the master CSV file with deduplication."""
+    """
+    Save collected resolution data to the master CSV file with improved structure handling.
+    Ensures consistent column ordering: [fixed columns] + [all countries in alphabetical order].
+    Handles deduplication based on token and link.
+    """
     if not rows:
         logging.info("No data to save.")
         return False
+
     try:
         output_file = CSV_FILE
+
+        # Track existing records to prevent duplicates
         existing_records = {}
         existing_tokens = set()
         existing_links = set()
+
+        # Detect existing columns if appending
         if append and os.path.exists(output_file):
             try:
                 df = pd.read_csv(output_file, encoding='utf-8', dtype=str, on_bad_lines='skip')
@@ -485,40 +500,38 @@ def save_to_csv(rows, append=False):
                             existing_tokens.add(token)
                         if link:
                             existing_links.add(link)
-                elif 'Link' in df.columns:
-                    for _, row in df.iterrows():
-                        link = row.get('Link', '').strip()
-                        if link:
-                            existing_records[link] = True
-                            existing_links.add(link)
+
                 logging.info(f"Loaded {len(existing_records)} existing records for deduplication")
             except Exception as e:
-                logging.warning(f"Error reading existing CSV: {e}")
-                try:
-                    with open(output_file, 'r', encoding='utf-8') as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            token = row.get('token', '').strip()
-                            link = row.get('Link', '').strip()
-                            if token and link:
-                                key = f"{token}_{link}"
-                                existing_records[key] = True
-                            if token:
-                                existing_tokens.add(token)
-                            if link:
-                                existing_links.add(link)
-                    logging.info(f"Fallback: Loaded {len(existing_records)} existing records")
-                except Exception as fallback_error:
-                    logging.error(f"Fallback CSV reading failed: {fallback_error}")
+                logging.warning(f"Error reading existing CSV for deduplication: {e}")
+
+        # Identify all columns (including country columns) dynamically
+        all_columns = set(FIXED_COLUMNS)
+
+        for row in rows:
+            all_columns.update(row.keys())
+
+        # Sort columns: Fixed first, countries (or extras) alphabetically after
+        country_columns = sorted([col for col in all_columns if col not in FIXED_COLUMNS])
+        ordered_columns = FIXED_COLUMNS + country_columns
+
+        # Deduplication step - prevent saving already known records
         unique_rows = []
         duplicates = 0
+
         for row in rows:
             token = row.get('token', '').strip()
             link = row.get('Link', '').strip()
             primary_key = f"{token}_{link}" if token and link else None
-            if (primary_key and primary_key in existing_records) or (token and token in existing_tokens) or (link and link in existing_links):
+
+            if (
+                (primary_key and primary_key in existing_records) or
+                (token and token in existing_tokens) or
+                (link and link in existing_links)
+            ):
                 duplicates += 1
                 continue
+
             unique_rows.append(row)
             if primary_key:
                 existing_records[primary_key] = True
@@ -526,41 +539,44 @@ def save_to_csv(rows, append=False):
                 existing_tokens.add(token)
             if link:
                 existing_links.add(link)
-        if duplicates > 0:
-            logging.info(f"Filtered out {duplicates} duplicate records")
+
+        logging.info(f"Filtered out {duplicates} duplicate records")
+
         if not unique_rows:
-            logging.info("No unique records to save")
+            logging.info("No unique records to save.")
             return True
-        all_cols = set(FIXED_COLUMNS)
-        if append and os.path.exists(output_file):
-            existing_country_columns = get_all_columns_from_csv(output_file)
-            all_cols.update(existing_country_columns)
+
+        # Ensure all rows have all columns
         for row in unique_rows:
-            all_cols.update(row.keys())
-        country_cols = sorted(list(all_cols - set(FIXED_COLUMNS)))
-        column_order = FIXED_COLUMNS + country_cols
-        for row in unique_rows:
-            for col in column_order:
+            for col in ordered_columns:
                 if col not in row:
                     row[col] = ""
-        mode = "a" if append and os.path.exists(output_file) else "w"
+
+        # File mode
+        mode = 'a' if append and os.path.exists(output_file) else 'w'
         write_header = not (append and os.path.exists(output_file))
-        with open(output_file, mode, newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=column_order)
+
+        # Write to CSV
+        with open(output_file, mode, newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=ordered_columns)
             if write_header:
                 writer.writeheader()
             writer.writerows(unique_rows)
+
+        logging.info(f"Saved {len(unique_rows)} new records to {output_file}")
+
+        # Optional count check
         if os.path.exists(output_file):
-            try:
-                with open(output_file, 'r', encoding='utf-8') as f:
-                    total_rows = sum(1 for _ in f) - 1
-                logging.info(f"Saved {len(unique_rows)} new records. Total in {output_file}: {total_rows}")
-            except:
-                logging.info(f"Saved {len(unique_rows)} new records")
+            with open(output_file, 'r', encoding='utf-8') as f:
+                total_rows = sum(1 for _ in f) - 1  # Minus header
+                logging.info(f"Total rows in file: {total_rows}")
+
         return True
+
     except Exception as e:
-        logging.error(f"Error saving CSV: {e}")
+        logging.error(f"Error saving CSV: {e}", exc_info=True)
         return False
+
 
 def clear_filters(driver):
     """Clear all filters to reset the search."""
