@@ -35,7 +35,7 @@ BASE_SEARCH_URL = (
     "https://digitallibrary.un.org/search?cc=Voting%20Data&ln=en&p=&f=&rm=&sf=&so=d"
     "&rg=50&c=Voting%20Data&c=&of=hb&fti=1&fct__9=Vote&fti=1"
 )
-CSV_FILE = "data\UN_VOTING_DATA_RAW.csv"  # Master CSV file
+CSV_FILE = "data/UN_VOTING_DATA_RAW.csv"  # Master CSV file
 MAX_PAGES_PER_YEAR = 50  # Maximum pages to paginate per year
 
 # Parallelism settings
@@ -546,115 +546,60 @@ def get_all_columns_from_csv(filepath):
         
 
 
-def save_to_csv(rows, append=False):
+def save_to_csv(new_rows):
     """
-    Save collected resolution data to the master CSV file with improved structure handling.
-    Ensures consistent column ordering: [fixed columns] + [all countries in alphabetical order].
-    Handles deduplication based on token and link.
+    Save collected resolution data to the master CSV file.
+    Updates the header to include new country columns if they appear.
+    Rewrites the CSV file completely so that every row has the same columns.
     """
-    if not rows:
-        logging.info("No data to save.")
-        return False
+    output_file = CSV_FILE
 
-    try:
-        output_file = CSV_FILE
-
-        # Track existing records to prevent duplicates
-        existing_records = {}
-        existing_tokens = set()
-        existing_links = set()
-
-        # Detect existing columns if appending
-        if append and os.path.exists(output_file):
-            try:
-                df = pd.read_csv(output_file, encoding='utf-8', dtype=str, on_bad_lines='skip')
-                if 'token' in df.columns and 'Link' in df.columns:
-                    for _, row in df.iterrows():
-                        token = row.get('token', '').strip()
-                        link = row.get('Link', '').strip()
-                        if token and link:
-                            key = f"{token}_{link}"
-                            existing_records[key] = True
-                        if token:
-                            existing_tokens.add(token)
-                        if link:
-                            existing_links.add(link)
-
-                logging.info(f"Loaded {len(existing_records)} existing records for deduplication")
-            except Exception as e:
-                logging.warning(f"Error reading existing CSV for deduplication: {e}")
-
-        # Identify all columns (including country columns) dynamically
-        all_columns = set(FIXED_COLUMNS)
-
-        for row in rows:
-            all_columns.update(row.keys())
-
-        # Sort columns: Fixed first, countries (or extras) alphabetically after
-        country_columns = sorted([col for col in all_columns if col not in FIXED_COLUMNS])
-        ordered_columns = FIXED_COLUMNS + country_columns
-
-        # Deduplication step - prevent saving already known records
-        unique_rows = []
-        duplicates = 0
-
-        for row in rows:
-            token = row.get('token', '').strip()
-            link = row.get('Link', '').strip()
-            primary_key = f"{token}_{link}" if token and link else None
-
-            if (
-                (primary_key and primary_key in existing_records) or
-                (token and token in existing_tokens) or
-                (link and link in existing_links)
-            ):
-                duplicates += 1
-                continue
-
-            unique_rows.append(row)
-            if primary_key:
-                existing_records[primary_key] = True
-            if token:
-                existing_tokens.add(token)
-            if link:
-                existing_links.add(link)
-
-        logging.info(f"Filtered out {duplicates} duplicate records")
-
-        if not unique_rows:
-            logging.info("No unique records to save.")
-            return True
-
-        # Ensure all rows have all columns
-        for row in unique_rows:
-            for col in ordered_columns:
-                if col not in row:
-                    row[col] = ""
-
-        # File mode
-        mode = 'a' if append and os.path.exists(output_file) else 'w'
-        write_header = not (append and os.path.exists(output_file))
-
-        # Write to CSV
-        with open(output_file, mode, newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=ordered_columns)
-            if write_header:
-                writer.writeheader()
-            writer.writerows(unique_rows)
-
-        logging.info(f"Saved {len(unique_rows)} new records to {output_file}")
-
-        # Optional count check
-        if os.path.exists(output_file):
+    # Load existing data if the file exists.
+    existing_rows = []
+    if os.path.exists(output_file):
+        try:
             with open(output_file, 'r', encoding='utf-8') as f:
-                total_rows = sum(1 for _ in f) - 1  # Minus header
-                logging.info(f"Total rows in file: {total_rows}")
+                reader = csv.DictReader(f)
+                existing_rows = list(reader)
+                existing_header = reader.fieldnames
+        except Exception as e:
+            logging.warning(f"Error reading existing CSV: {e}")
+            existing_header = FIXED_COLUMNS
+    else:
+        existing_header = FIXED_COLUMNS
 
-        return True
+    # Combine existing rows with new rows.
+    combined_rows = existing_rows + new_rows
 
+    # Determine the full set of columns.
+    # Start with fixed columns, add any extra columns found in the rows.
+    all_columns = set(FIXED_COLUMNS)
+    for row in combined_rows:
+        all_columns.update(row.keys())
+
+    # Order columns: fixed columns first, then any extra (e.g., country columns) sorted alphabetically.
+    country_columns = sorted([col for col in all_columns if col not in FIXED_COLUMNS])
+    ordered_columns = FIXED_COLUMNS + country_columns
+
+    # Ensure every row has all the columns.
+    for row in combined_rows:
+        for col in ordered_columns:
+            if col not in row:
+                row[col] = ""
+
+    # Write out the entire CSV file with the updated header.
+    try:
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=ordered_columns)
+            writer.writeheader()
+            writer.writerows(combined_rows)
+        logging.info(f"Saved {len(new_rows)} new records (total now {len(combined_rows)}) to {output_file}")
     except Exception as e:
-        logging.error(f"Error saving CSV: {e}", exc_info=True)
+        logging.error(f"Error writing CSV: {e}")
         return False
+
+    return True
+
 
 
 def clear_filters(driver):
@@ -760,7 +705,7 @@ def main():
     if os.path.exists(CSV_FILE):
         clean_existing_csv()
     else:
-        save_to_csv([], append=False)
+        save_to_csv([])
         logging.info(f"Created new master CSV file: {CSV_FILE}")
     
     # Load all links from CSV using regex into an in-memory set (no file writing)
@@ -816,13 +761,13 @@ def main():
                 batch_rows, failed_links = parallel_scrape_resolutions(year_links, year, MAX_WORKERS)
 
                 if batch_rows:
-                    save_to_csv(batch_rows, append=True)
+                    save_to_csv(batch_rows)
                 
                 # Check for failed_links here and retry if needed
                 if failed_links:
                     retry_rows = retry_failed_links(failed_links, year)
                     if retry_rows:
-                        save_to_csv(retry_rows, append=True)
+                        save_to_csv(retry_rows)
             else:
                 for i in range(0, len(year_links), BATCH_SIZE):
                     prevent_sleep()
@@ -838,12 +783,12 @@ def main():
                     batch_rows, failed_links = batch_scrape_resolutions(batch_links, driver, year, batch_size=15)
                     
                     if batch_rows:
-                        save_to_csv(batch_rows, append=True)
+                        save_to_csv(batch_rows)
 
                     if failed_links:
                         retry_rows = retry_failed_links(failed_links, year)
                         if retry_rows:
-                            save_to_csv(retry_rows, append=True)
+                            save_to_csv(retry_rows)
             
             csv_links.update(year_links)
             time.sleep(1)
