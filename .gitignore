@@ -7,7 +7,6 @@ __pycache__/
 #hide testing file
 test_files/
 test.py
-target_country_test.ipynb
 pipeline_LLM_test.ipynb
 
 
