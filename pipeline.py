@@ -203,68 +203,16 @@ Rules:
         logger.error(f"Invalid stage: {stage}")
         return None
 
-# ============= PARALLEL PROCESSING ============= #
+# ============= SEQUENTIAL PROCESSING FOR EACH ROW ============= #
 
-def process_subtag2(args: Tuple[str, str, str, str]) -> List[List]:
-    """Process a single subtag2 classification task (for parallel execution)"""
-    title, main_tag, subtag1, model = args
-    results = []
-    
-    subtag2_result = call_api_staged(
-        title, 
-        stage=3, 
-        previous_tags={"main_tag": main_tag, "subtag1": subtag1},
-        model=model
-    )
-    
-    if subtag2_result.subtag2s:
-        for subtag2 in subtag2_result.subtag2s:
-            results.append([main_tag, subtag1, subtag2])
-    else:
-        logger.debug(f"No subtag2s found for {main_tag} > {subtag1}")
-        
-    return results
-
-def process_subtag1(args: Tuple[str, str, str, int]) -> List[List]:
-    """Process a single subtag1 classification task and its nested subtag2 tasks (for parallel execution)"""
-    title, main_tag, model, max_workers = args
-    results = []
-    
-    subtag1_result = call_api_staged(
-        title, 
-        stage=2, 
-        previous_tags={"main_tag": main_tag},
-        model=model
-    )
-    
-    if not subtag1_result.subtag1s:
-        logger.debug(f"No subtag1s found for main tag: {main_tag}")
-        return []
-        
-    # Use parallel processing for subtag2 classification
-    subtag2_tasks = [(title, main_tag, subtag1, model) for subtag1 in subtag1_result.subtag1s]
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_subtag2, task): task for task in subtag2_tasks}
-        for future in as_completed(futures):
-            task = futures[future]
-            try:
-                for result in future.result():
-                    results.append(result)
-            except Exception as e:
-                subtag1 = task[2]
-                logger.error(f"Error processing {main_tag} > {subtag1}: {e}")
-    
-    return results
-
-def get_tags_parallel(title: str, model: str = DEFAULT_MODEL, max_workers: int = DEFAULT_MAX_WORKERS) -> List[List]:
+def get_tags_sequential(title: str, model: str = DEFAULT_MODEL) -> List[List]:
     """
-    Gets classification tags for a UN resolution using parallel processing.
+    Gets classification tags for a UN resolution using sequential processing within a row.
+    This ensures that dependencies between API calls are correctly handled.
     
     Args:
         title: The resolution title to classify
         model: OpenAI model to use
-        max_workers: Maximum number of parallel worker threads
         
     Returns:
         List of lists containing [tag, subtag1, subtag2] classifications
@@ -278,19 +226,35 @@ def get_tags_parallel(title: str, model: str = DEFAULT_MODEL, max_workers: int =
         logger.warning(f"No main tags found for: {title[:50]}...")
         return []
     
-    # Process each main tag with parallel subtag1 processing
-    subtag1_tasks = [(title, main_tag, model, max_workers) for main_tag in main_tags_result.main_tags]
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_subtag1, task): task for task in subtag1_tasks}
-        for future in as_completed(futures):
-            task = futures[future]
-            main_tag = task[1]
-            try:
-                results = future.result()
-                final_results.extend(results)
-            except Exception as e:
-                logger.error(f"Error processing main tag {main_tag}: {e}")
+    # Process each main tag sequentially
+    for main_tag in main_tags_result.main_tags:
+        # Get subtag1 results
+        subtag1_result = call_api_staged(
+            title, 
+            stage=2, 
+            previous_tags={"main_tag": main_tag},
+            model=model
+        )
+        
+        if not subtag1_result.subtag1s:
+            logger.debug(f"No subtag1s found for main tag: {main_tag}")
+            continue
+            
+        # Process each subtag1 sequentially
+        for subtag1 in subtag1_result.subtag1s:
+            # Get subtag2 results
+            subtag2_result = call_api_staged(
+                title, 
+                stage=3, 
+                previous_tags={"main_tag": main_tag, "subtag1": subtag1},
+                model=model
+            )
+            
+            if subtag2_result.subtag2s:
+                for subtag2 in subtag2_result.subtag2s:
+                    final_results.append([main_tag, subtag1, subtag2])
+            else:
+                logger.debug(f"No subtag2s found for {main_tag} > {subtag1}")
     
     elapsed_time = time.time() - start_time
     logger.debug(f"Classification completed in {elapsed_time:.2f}s")
@@ -305,11 +269,13 @@ def process_dataframe(df: pd.DataFrame,
                       show_progress: bool = True) -> pd.DataFrame:
     """
     Process a dataframe of UN resolutions to add classification tags.
+    Uses parallel processing ONLY at the row level, ensuring that
+    the processing within each row is sequential.
     
     Args:
         df: DataFrame with a 'Title' column containing resolution titles
         model: OpenAI model to use
-        max_workers: Maximum number of parallel worker threads
+        max_workers: Maximum number of parallel worker threads (for processing rows)
         show_progress: Whether to display a progress bar
         
     Returns:
@@ -321,17 +287,48 @@ def process_dataframe(df: pd.DataFrame,
     # Create a copy to avoid modifying the original
     result_df = df.copy()
     
-    # Define the processing function
-    def process_row(row):
-        return get_tags_parallel(row['Title'], model=model, max_workers=max_workers)
-    
-    # Process with or without progress bar
-    if show_progress:
-        tqdm.pandas(desc="Classifying resolutions")
-        result_df['tags'] = result_df.progress_apply(process_row, axis=1)
+    # Process each row in parallel
+    if max_workers > 1:
+        logger.info(f"Processing {len(df)} rows with {max_workers} parallel workers")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Create a list to store futures and corresponding indices
+            futures = []
+            indices = []
+            
+            # Submit all tasks
+            for idx, row in df.iterrows():
+                future = executor.submit(get_tags_sequential, row['Title'], model)
+                futures.append(future)
+                indices.append(idx)
+            
+            # Create a list to store results
+            results = [None] * len(futures)
+            
+            # Process results as they complete
+            if show_progress:
+                for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Classifying resolutions")):
+                    results[indices[i]] = future.result()
+            else:
+                for i, future in enumerate(as_completed(futures)):
+                    results[indices[i]] = future.result()
+            
+            # Add results to the dataframe
+            result_df['tags'] = results
     else:
-        result_df['tags'] = result_df.apply(process_row, axis=1)
+        # Process sequentially if max_workers is 1
+        logger.info("Processing rows sequentially (max_workers=1)")
         
+        # Define the processing function
+        def process_row(row):
+            return get_tags_sequential(row['Title'], model=model)
+        
+        # Process with or without progress bar
+        if show_progress:
+            tqdm.pandas(desc="Classifying resolutions")
+            result_df['tags'] = result_df.progress_apply(process_row, axis=1)
+        else:
+            result_df['tags'] = result_df.apply(process_row, axis=1)
+    
     return result_df
 
 # ============= MAIN EXECUTION ============= #
